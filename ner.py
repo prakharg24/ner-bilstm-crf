@@ -17,16 +17,30 @@ def argmax(vec):
     return to_scalar(idx)
 
 
-def prepare_sequence(seq, to_ix):
-	idxs = []
-	for w in seq:
-		if w in to_ix:
-		    idxs.append(to_ix[w])
-		else:
-			idxs.append(to_ix['Unk'])
-	tensor = torch.LongTensor(idxs)
-
-	return autograd.Variable(tensor)
+def prepare_sequence(seq, word_to_ix, char_to_ix):
+    idxs = []
+    caps = []
+    # lngth = []
+    for w in seq:
+        if w[0].isupper():
+            caps.append(1.0)
+        else:
+            caps.append(0.0)
+        if w in word_to_ix:
+            idxs.append(word_to_ix[w])
+        else:
+            idxs.append(word_to_ix['Unk'])
+    tensor = torch.LongTensor(idxs)
+    fidxs = []
+    for w in seq:
+        cidxs = []
+        for c in w:
+            if c in char_to_ix:
+                cidxs.append(char_to_ix[c])
+            else:
+                cidxs.append(char_to_ix['#'])
+        fidxs.append(autograd.Variable(torch.LongTensor(cidxs)))
+    return autograd.Variable(tensor), fidxs, autograd.Variable(torch.FloatTensor(caps).view(-1, 1))
 
 
 # Compute log sum exp in a numerically stable way for the forward algorithm
@@ -38,20 +52,29 @@ def log_sum_exp(vec):
 
 class BiLSTM_CRF(nn.Module):
 
-    def __init__(self, vocab_size, tag_to_ix, embedding_dim, hidden_dim):
+    def __init__(self, vocab_size, char_size, tag_to_ix, embedding_dim, char_embedding, hidden_dim, hidden_dim_char):
         super(BiLSTM_CRF, self).__init__()
         self.embedding_dim = embedding_dim
+        self.char_embedding = char_embedding
         self.hidden_dim = hidden_dim
+        self.hidden_dim_char = hidden_dim_char
         self.vocab_size = vocab_size
+        self.char_size = char_size
         self.tag_to_ix = tag_to_ix
         self.tagset_size = len(tag_to_ix)
 
         self.word_embeds = nn.Embedding(vocab_size, embedding_dim)
+        self.char_embeds = nn.Embedding(char_size, char_embedding)
         self.lstm = nn.LSTM(embedding_dim, hidden_dim // 2,
+                            num_layers=1, bidirectional=True)
+        self.char_lstm = nn.LSTM(char_embedding, hidden_dim_char // 2,
                             num_layers=1, bidirectional=True)
 
         # Maps the output of the LSTM into tag space.
         self.hidden2tag = nn.Linear(hidden_dim, self.tagset_size)
+        self.hidden2tag_char = nn.Linear(hidden_dim_char, self.tagset_size)
+
+        self.jointhem = nn.Linear(2*self.tagset_size + 1, self.tagset_size)
 
         # Matrix of transition parameters.  Entry i,j is the score of
         # transitioning *to* i *from* j.
@@ -64,10 +87,15 @@ class BiLSTM_CRF(nn.Module):
         self.transitions.data[:, tag_to_ix[STOP_TAG]] = -10000
 
         self.hidden = self.init_hidden()
+        self.char_hidden = self.init_char_hidden()
 
     def init_hidden(self):
         return (autograd.Variable(torch.randn(2, 1, self.hidden_dim // 2)),
                 autograd.Variable(torch.randn(2, 1, self.hidden_dim // 2)))
+
+    def init_char_hidden(self):
+        return (autograd.Variable(torch.randn(2, 1, self.hidden_dim_char // 2)),
+                autograd.Variable(torch.randn(2, 1, self.hidden_dim_char // 2)))
 
     def _forward_alg(self, feats):
         # Do the forward algorithm to compute the partition function
@@ -107,6 +135,15 @@ class BiLSTM_CRF(nn.Module):
         lstm_out = lstm_out.view(len(sentence), self.hidden_dim)
         lstm_feats = self.hidden2tag(lstm_out)
         return lstm_feats
+
+    def _get_char_lstm(self, word):
+        self.char_hidden = self.init_char_hidden()
+        old_embeds = self.char_embeds(word)
+        embeds = old_embeds.view(len(word), 1, -1)
+        lstm_out, self.char_hidden = self.char_lstm(embeds, self.char_hidden)
+        lstm_out = lstm_out.view(len(word), self.hidden_dim_char)
+        lstm_feats = self.hidden2tag_char(lstm_out)
+        return lstm_feats[-1].view(1, -1)
 
     def _score_sentence(self, feats, tags):
         # Gives the score of a provided tag sequence
@@ -162,15 +199,34 @@ class BiLSTM_CRF(nn.Module):
         best_path.reverse()
         return path_score, best_path
 
-    def neg_log_likelihood(self, sentence, tags):
+    def neg_log_likelihood(self, sentence, words, caps, tags):
         feats = self._get_lstm_features(sentence)
+
+        final_char = self._get_char_lstm(words[0])
+        for word in words[1:]:
+            lstm_char_feats = self._get_char_lstm(word)
+            final_char = torch.cat([final_char, lstm_char_feats])
+
+        feats = torch.cat([feats, final_char], dim=1)
+        feats = torch.cat([feats, caps], dim=1)
+        feats = self.jointhem(feats)
+
         forward_score = self._forward_alg(feats)
         gold_score = self._score_sentence(feats, tags)
         return forward_score - gold_score
 
-    def forward(self, sentence):  # dont confuse this with _forward_alg above.
+    def forward(self, sentence, words, caps):  # dont confuse this with _forward_alg above.
         # Get the emission scores from the BiLSTM
         lstm_feats = self._get_lstm_features(sentence)
+
+        final_char = self._get_char_lstm(words[0])
+        for word in words[1:]:
+            lstm_char_feats = self._get_char_lstm(word)
+            final_char = torch.cat([final_char, lstm_char_feats])
+
+        lstm_feats = torch.cat([lstm_feats, final_char], dim=1)
+        lstm_feats = torch.cat([lstm_feats, caps], dim=1)
+        lstm_feats = self.jointhem(lstm_feats)
 
         # Find the best path, given the features.
         score, tag_seq = self._viterbi_decode(lstm_feats)
@@ -178,8 +234,10 @@ class BiLSTM_CRF(nn.Module):
 
 START_TAG = "<START>"
 STOP_TAG = "<STOP>"
-EMBEDDING_DIM = 5
-HIDDEN_DIM = 4
+EMBEDDING_DIM = 50
+CHAR_DIM = 30
+HIDDEN_DIM = 50
+HIDDEN_DIM_CHAR = 30
 
 lines = [line.rstrip('\n') for line in open('/home/cse/btech/cs1150245/scratch/train.txt')]
 
@@ -197,30 +255,46 @@ for word in lines:
         word1.append(curr_word[0])
         tag.append(curr_word[1])
 
+print(len(full_data))
+
 training_data = full_data[:3000]
 test_data = full_data[3000:]
 
+max_word_len = 0
 
 word_to_ix = {}
 for sentence, tags in training_data:
     for word in sentence:
+        if(len(word)>max_word_len):
+            max_word_len = len(word)
         if word not in word_to_ix:
             word_to_ix[word] = len(word_to_ix)
 
+char_to_ix = {}
+for sentence, tags in training_data:
+    for word in sentence:
+        for char in word:
+            if char not in char_to_ix:
+                char_to_ix[char] = len(char_to_ix)
+
 word_to_ix['Unk'] = len(word_to_ix)
+if not '#' in char_to_ix:
+    char_to_ix['#'] = len(char_to_ix)
 
 tag_to_ix = {"O": 0, "T": 1, "D": 2, START_TAG: 3, STOP_TAG: 4}
 
-model = BiLSTM_CRF(len(word_to_ix), tag_to_ix, EMBEDDING_DIM, HIDDEN_DIM)
+print(len(char_to_ix))
+
+model = BiLSTM_CRF(len(word_to_ix), len(char_to_ix), tag_to_ix, EMBEDDING_DIM, CHAR_DIM, HIDDEN_DIM, HIDDEN_DIM_CHAR)
 optimizer = optim.SGD(model.parameters(), lr=0.01, weight_decay=1e-4)
 
 # Check predictions before training
-precheck_sent = prepare_sequence(training_data[0][0], word_to_ix)
-precheck_tags = torch.LongTensor([tag_to_ix[t] for t in training_data[0][1]])
-print(model(precheck_sent))
+# precheck_sent = prepare_sequence(training_data[0][0], word_to_ix)
+# precheck_tags = torch.LongTensor([tag_to_ix[t] for t in training_data[0][1]])
+# print(model(precheck_sent))
 
 # Make sure prepare_sequence from earlier in the LSTM section is loaded
-for epoch in range(10):  # again, normally you would NOT do 300 epochs, it is toy data
+for epoch in range(20):  # again, normally you would NOT do 300 epochs, it is toy data
     for sentence, tags in training_data:
         # Step 1. Remember that Pytorch accumulates gradients.
         # We need to clear them out before each instance
@@ -228,30 +302,26 @@ for epoch in range(10):  # again, normally you would NOT do 300 epochs, it is to
 
         # Step 2. Get our inputs ready for the network, that is,
         # turn them into Variables of word indices.
-        sentence_in = prepare_sequence(sentence, word_to_ix)
+        sentence_in, words_in, caps_in = prepare_sequence(sentence, word_to_ix, char_to_ix)
         targets = torch.LongTensor([tag_to_ix[t] for t in tags])
 
         # Step 3. Run our forward pass.
-        neg_log_likelihood = model.neg_log_likelihood(sentence_in, targets)
+        neg_log_likelihood = model.neg_log_likelihood(sentence_in, words_in, caps_in, targets)
 
         # Step 4. Compute the loss, gradients, and update the parameters by
         # calling optimizer.step()
         neg_log_likelihood.backward()
         optimizer.step()
+    # torch.save(model.state_dict(), '/home/cse/btech/cs1150245/scratch/model' + '_' + str(epoch) + '.pth')
+    corr_arr = []
+    pred_arr = []
+    for sent in test_data:
+        precheck_sent, precheck_words, precheck_caps = prepare_sequence(sent[0], word_to_ix, char_to_ix)
+        some_model = model(precheck_sent, precheck_words, precheck_caps)
+        ans_tag = some_model[1]
+        for corr_tag, pred in zip(sent[1], ans_tag):
+            corr_arr.append(tag_to_ix[corr_tag])
+            pred_arr.append(pred)
+    print(metrics.f1_score(corr_arr, pred_arr, average='macro', labels=[1, 2]))
 
-corr_arr = []
-pred_arr = []
-
-# Check predictions after training
-for sent in test_data:
-	print("Test : \n\n")
-	precheck_sent = prepare_sequence(sent[0], word_to_ix)
-	some_model = model(precheck_sent)
-	ans_tag = some_model[1]
-	for corr_tag, pred in zip(sent[1], ans_tag):
-		corr_arr.append(tag_to_ix[corr_tag])
-		pred_arr.append(pred)
-	# print(ans_tag)
-	# print(sent[1])
-
-print(metrics.f1_score(corr_arr, pred_arr, average='macro'))
+# def getscore()
