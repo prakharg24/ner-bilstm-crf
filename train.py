@@ -31,8 +31,6 @@ for sent in tagless_data:
         temp_sent.append((word_tag[0], word_tag[1], word[1]))
     full_data.append(temp_sent)
 
-print(len(full_data))
-
 def word2features(sent, i):
     word = sent[i][0]
     postag = sent[i][1]
@@ -98,46 +96,22 @@ def sent2features(sent):
 def sent2labels(sent):
     return [label for token, postag, label in sent]
 
-seed_arr = [10, 100, 120, 75, 457]
+np.random.shuffle(full_data)
 
-fs_sum = 0.0
+X_train = [sent2features(s) for s in full_data]
+y_train = [sent2labels(s) for s in full_data]
 
-for c1i in [0.1, 0.05]:
-    for c2i in [0.1, 0.05]:
-        for i in range(0, 5):
-            print(i)
-            np.random.seed(seed_arr[i])
+crf = sklearn_crfsuite.CRF(
+    algorithm='lbfgs',
+    c1=0.1, 
+    c2=0.1, 
+    max_iterations=100,
+    all_possible_transitions=False,
+)
+crf.fit(X_train, y_train)
 
-            np.random.shuffle(full_data)
+my_pred = crf.predict(X_train)
+print(metrics.flat_f1_score(my_pred, y_train, average='macro', labels=['D', 'T']))
 
-            training_data = full_data[:3000]
-            test_data = full_data[3000:]
-
-            train_sents = training_data
-            test_sents = test_data
-
-            X_train = [sent2features(s) for s in train_sents]
-            y_train = [sent2labels(s) for s in train_sents]
-
-            X_test = [sent2features(s) for s in test_sents]
-            y_test = [sent2labels(s) for s in test_sents]
-
-
-            crf = sklearn_crfsuite.CRF(
-                algorithm='lbfgs',
-                c1=c1i, 
-                c2=c2i, 
-                max_iterations=100,
-                all_possible_transitions=False,
-            )
-            crf.fit(X_train, y_train)
-            my_pred = crf.predict(X_test)
-
-
-            fs_sum += metrics.flat_f1_score(my_pred, y_test, average='macro', labels=['D', 'T'])
-
-            # with open('crf_model.pkl', 'wb') as file:
-            #     pickle.dump(crf, file)
-
-        print(c1i, c2i, fs_sum/5)
-        fs_sum = 0.0
+with open('crf_model.pkl', 'wb') as file:
+    pickle.dump(crf, file)
