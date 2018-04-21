@@ -16,12 +16,42 @@ def argmax(vec):
     _, idx = torch.max(vec, 1)
     return to_scalar(idx)
 
+def is_disease(word):
+    if(len(word)<3):
+        return False
+    elif(word[-2:]=='al' or word[-2:]=='ic' or word[-3:]=='ies' or word[-2:]=='is' or word[-2:]=='ia'):
+        return True
+    else:
+        return False        
 
-def prepare_sequence(seq, word_to_ix, char_to_ix):
+def is_treatment(word):
+    if(len(word)<2):
+        return False
+    elif(word[-2:]=='in'):
+        return True
+    elif(len(word)<7):
+        return False
+    elif(word[-7:]=='surgery' or word[-7:]=='therapy'):
+        return True
+    else:
+        return False
+
+def prepare_sequence(seq, word_to_ix, char_to_ix, max_word_len):
     idxs = []
     caps = []
-    # lngth = []
+    lngth = []
+    treatment = []
+    disease = []
     for w in seq:
+        if(is_treatment(w)):
+            treatment.append(1.0)
+        else:
+            treatment.append(0.0)
+        if(is_disease(w)):
+            disease.append(1.0)
+        else:
+            disease.append(0.0)
+        lngth.append((len(w) + 0.0)/max_word_len)
         if w[0].isupper():
             caps.append(1.0)
         else:
@@ -40,7 +70,7 @@ def prepare_sequence(seq, word_to_ix, char_to_ix):
             else:
                 cidxs.append(char_to_ix['#'])
         fidxs.append(autograd.Variable(torch.LongTensor(cidxs)))
-    return autograd.Variable(tensor), fidxs, autograd.Variable(torch.FloatTensor(caps).view(-1, 1))
+    return autograd.Variable(tensor), fidxs, autograd.Variable(torch.FloatTensor(caps).view(-1, 1)), autograd.Variable(torch.FloatTensor(lngth).view(-1, 1)), autograd.Variable(torch.FloatTensor(treatment).view(-1, 1)), autograd.Variable(torch.FloatTensor(disease).view(-1, 1))
 
 
 # Compute log sum exp in a numerically stable way for the forward algorithm
@@ -74,7 +104,7 @@ class BiLSTM_CRF(nn.Module):
         self.hidden2tag = nn.Linear(hidden_dim, self.tagset_size)
         self.hidden2tag_char = nn.Linear(hidden_dim_char, self.tagset_size)
 
-        self.jointhem = nn.Linear(2*self.tagset_size + 1, self.tagset_size)
+        self.jointhem = nn.Linear(self.tagset_size + 4, self.tagset_size)
 
         # Matrix of transition parameters.  Entry i,j is the score of
         # transitioning *to* i *from* j.
@@ -199,7 +229,7 @@ class BiLSTM_CRF(nn.Module):
         best_path.reverse()
         return path_score, best_path
 
-    def neg_log_likelihood(self, sentence, words, caps, tags):
+    def neg_log_likelihood(self, sentence, words, caps, lngth, treatment, disease,tags):
         feats = self._get_lstm_features(sentence)
 
         final_char = self._get_char_lstm(words[0])
@@ -207,15 +237,18 @@ class BiLSTM_CRF(nn.Module):
             lstm_char_feats = self._get_char_lstm(word)
             final_char = torch.cat([final_char, lstm_char_feats])
 
-        feats = torch.cat([feats, final_char], dim=1)
+        # feats = torch.cat([feats, final_char], dim=1)
         feats = torch.cat([feats, caps], dim=1)
+        feats = torch.cat([feats, lngth], dim=1)
+        feats = torch.cat([feats, treatment], dim=1)
+        feats = torch.cat([feats, disease], dim=1)
         feats = self.jointhem(feats)
 
         forward_score = self._forward_alg(feats)
         gold_score = self._score_sentence(feats, tags)
         return forward_score - gold_score
 
-    def forward(self, sentence, words, caps):  # dont confuse this with _forward_alg above.
+    def forward(self, sentence, words, caps, lngth, treatment, disease):  # dont confuse this with _forward_alg above.
         # Get the emission scores from the BiLSTM
         lstm_feats = self._get_lstm_features(sentence)
 
@@ -224,8 +257,11 @@ class BiLSTM_CRF(nn.Module):
             lstm_char_feats = self._get_char_lstm(word)
             final_char = torch.cat([final_char, lstm_char_feats])
 
-        lstm_feats = torch.cat([lstm_feats, final_char], dim=1)
+        # lstm_feats = torch.cat([lstm_feats, final_char], dim=1)
         lstm_feats = torch.cat([lstm_feats, caps], dim=1)
+        lstm_feats = torch.cat([lstm_feats, lngth], dim=1)
+        lstm_feats = torch.cat([lstm_feats, treatment], dim=1)
+        lstm_feats = torch.cat([lstm_feats, disease], dim=1)
         lstm_feats = self.jointhem(lstm_feats)
 
         # Find the best path, given the features.
@@ -235,9 +271,9 @@ class BiLSTM_CRF(nn.Module):
 START_TAG = "<START>"
 STOP_TAG = "<STOP>"
 EMBEDDING_DIM = 50
-CHAR_DIM = 30
+CHAR_DIM = 10
 HIDDEN_DIM = 50
-HIDDEN_DIM_CHAR = 30
+HIDDEN_DIM_CHAR = 10
 
 lines = [line.rstrip('\n') for line in open('/home/cse/btech/cs1150245/scratch/train.txt')]
 
@@ -302,11 +338,11 @@ for epoch in range(20):  # again, normally you would NOT do 300 epochs, it is to
 
         # Step 2. Get our inputs ready for the network, that is,
         # turn them into Variables of word indices.
-        sentence_in, words_in, caps_in = prepare_sequence(sentence, word_to_ix, char_to_ix)
+        sentence_in, words_in, caps_in, lngth_in, treatment_in, disease_in = prepare_sequence(sentence, word_to_ix, char_to_ix, max_word_len)
         targets = torch.LongTensor([tag_to_ix[t] for t in tags])
 
         # Step 3. Run our forward pass.
-        neg_log_likelihood = model.neg_log_likelihood(sentence_in, words_in, caps_in, targets)
+        neg_log_likelihood = model.neg_log_likelihood(sentence_in, words_in, caps_in, lngth_in, treatment_in, disease_in, targets)
 
         # Step 4. Compute the loss, gradients, and update the parameters by
         # calling optimizer.step()
@@ -316,8 +352,8 @@ for epoch in range(20):  # again, normally you would NOT do 300 epochs, it is to
     corr_arr = []
     pred_arr = []
     for sent in test_data:
-        precheck_sent, precheck_words, precheck_caps = prepare_sequence(sent[0], word_to_ix, char_to_ix)
-        some_model = model(precheck_sent, precheck_words, precheck_caps)
+        precheck_sent, precheck_words, precheck_caps, precheck_lngth, precheck_treatment, precheck_disease = prepare_sequence(sent[0], word_to_ix, char_to_ix, max_word_len)
+        some_model = model(precheck_sent, precheck_words, precheck_caps, precheck_lngth, precheck_treatment, precheck_disease)
         ans_tag = some_model[1]
         for corr_tag, pred in zip(sent[1], ans_tag):
             corr_arr.append(tag_to_ix[corr_tag])
